@@ -1,0 +1,23 @@
+# Build output
+bin/
+dist/
+*.exe
+*.test
+
+# Runtime data
+.omnidrive/
+data/
+cache/
+tmp/
+credentials.json
+client_secret*.json
+
+# Go
+docs/
+/vendor/
+go.work
+
+# Editor
+.github/
+.vscode/
+!.vscode/tasks.json
