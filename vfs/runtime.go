@@ -227,6 +227,7 @@ func (rt *Runtime) syncAllAccounts(ctx context.Context) error {
 			EncryptedRefreshToken: account.EncryptedRefreshToken,
 			TotalSpace:            total,
 			UsedSpace:             used,
+			Priority:              account.Priority,
 			IsActive:              account.IsActive,
 			AddedAt:               account.AddedAt,
 		}); err != nil {

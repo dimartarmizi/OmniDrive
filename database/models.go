@@ -7,6 +7,7 @@ type CloudAccount struct {
 	EncryptedRefreshToken string
 	TotalSpace            int64
 	UsedSpace             int64
+	Priority              int
 	IsActive              bool
 	AddedAt               time.Time
 }

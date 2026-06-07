@@ -3,10 +3,10 @@ package database
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
@@ -38,7 +38,7 @@ func (s *Store) Close() error { return s.db.Close() }
 func (s *Store) Migrate(ctx context.Context) error {
 	stmts := []string{
 		`PRAGMA journal_mode=WAL`,
-		`CREATE TABLE IF NOT EXISTS accounts (email TEXT PRIMARY KEY, encrypted_refresh_token TEXT NOT NULL, total_space INTEGER NOT NULL DEFAULT 0, used_space INTEGER NOT NULL DEFAULT 0, is_active INTEGER NOT NULL DEFAULT 1, added_at TEXT NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS accounts (email TEXT PRIMARY KEY, encrypted_refresh_token TEXT NOT NULL, total_space INTEGER NOT NULL DEFAULT 0, used_space INTEGER NOT NULL DEFAULT 0, priority INTEGER NOT NULL DEFAULT 0, is_active INTEGER NOT NULL DEFAULT 1, added_at TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS virtual_files (virtual_path TEXT PRIMARY KEY, display_name TEXT NOT NULL, original_name TEXT NOT NULL, is_dir INTEGER NOT NULL, size INTEGER NOT NULL, mod_time TEXT NOT NULL, account_email TEXT NOT NULL, google_file_id TEXT NOT NULL, parent_id TEXT NOT NULL, mime_type TEXT NOT NULL)`,
 		`CREATE INDEX IF NOT EXISTS idx_virtual_parent ON virtual_files(parent_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_virtual_account ON virtual_files(account_email)`,
@@ -48,19 +48,41 @@ func (s *Store) Migrate(ctx context.Context) error {
 			return err
 		}
 	}
+	if err := s.ensureAccountsPriorityColumn(ctx); err != nil {
+		return err
+	}
+	if err := s.normalizeAccountPriorities(ctx); err != nil {
+		return err
+	}
 	return nil
 }
 
 func (s *Store) UpsertAccount(ctx context.Context, account CloudAccount) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO accounts(email, encrypted_refresh_token, total_space, used_space, is_active, added_at)
-		VALUES(?, ?, ?, ?, ?, ?)
-		ON CONFLICT(email) DO UPDATE SET encrypted_refresh_token=excluded.encrypted_refresh_token,total_space=excluded.total_space,used_space=excluded.used_space,is_active=excluded.is_active`,
-		account.Email, account.EncryptedRefreshToken, account.TotalSpace, account.UsedSpace, boolInt(account.IsActive), account.AddedAt.Format(time.RFC3339Nano))
+	priority := account.Priority
+	if priority <= 0 {
+		existing, err := s.GetAccount(ctx, account.Email)
+		if err == nil {
+			priority = existing.Priority
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+	}
+	if priority <= 0 {
+		next, err := s.nextAccountPriority(ctx)
+		if err != nil {
+			return err
+		}
+		priority = next
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO accounts(email, encrypted_refresh_token, total_space, used_space, priority, is_active, added_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(email) DO UPDATE SET encrypted_refresh_token=excluded.encrypted_refresh_token,total_space=excluded.total_space,used_space=excluded.used_space,priority=excluded.priority,is_active=excluded.is_active`,
+		account.Email, account.EncryptedRefreshToken, account.TotalSpace, account.UsedSpace, priority, boolInt(account.IsActive), account.AddedAt.Format(time.RFC3339Nano))
 	return err
 }
 
 func (s *Store) ListAccounts(ctx context.Context) ([]CloudAccount, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT email, encrypted_refresh_token, total_space, used_space, is_active, added_at FROM accounts WHERE is_active=1 ORDER BY email`)
+	rows, err := s.db.QueryContext(ctx, `SELECT email, encrypted_refresh_token, total_space, used_space, priority, is_active, added_at FROM accounts WHERE is_active=1 ORDER BY priority, added_at, email`)
 	if err != nil {
 		return nil, err
 	}
@@ -70,7 +92,7 @@ func (s *Store) ListAccounts(ctx context.Context) ([]CloudAccount, error) {
 		var a CloudAccount
 		var active int
 		var added string
-		if err := rows.Scan(&a.Email, &a.EncryptedRefreshToken, &a.TotalSpace, &a.UsedSpace, &active, &added); err != nil {
+		if err := rows.Scan(&a.Email, &a.EncryptedRefreshToken, &a.TotalSpace, &a.UsedSpace, &a.Priority, &active, &added); err != nil {
 			return nil, err
 		}
 		a.IsActive = active == 1
@@ -81,11 +103,11 @@ func (s *Store) ListAccounts(ctx context.Context) ([]CloudAccount, error) {
 }
 
 func (s *Store) GetAccount(ctx context.Context, email string) (*CloudAccount, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT email, encrypted_refresh_token, total_space, used_space, is_active, added_at FROM accounts WHERE email=?`, email)
+	row := s.db.QueryRowContext(ctx, `SELECT email, encrypted_refresh_token, total_space, used_space, priority, is_active, added_at FROM accounts WHERE email=?`, email)
 	var a CloudAccount
 	var active int
 	var added string
-	if err := row.Scan(&a.Email, &a.EncryptedRefreshToken, &a.TotalSpace, &a.UsedSpace, &active, &added); err != nil {
+	if err := row.Scan(&a.Email, &a.EncryptedRefreshToken, &a.TotalSpace, &a.UsedSpace, &a.Priority, &active, &added); err != nil {
 		return nil, err
 	}
 	a.IsActive = active == 1
@@ -100,6 +122,10 @@ func (s *Store) TotalQuota(ctx context.Context) (total, used int64, err error) {
 }
 
 func (s *Store) BestUploadAccount(ctx context.Context) (*CloudAccount, error) {
+	return s.BestUploadAccountForSize(ctx, 0)
+}
+
+func (s *Store) BestUploadAccountForSize(ctx context.Context, requiredSize int64) (*CloudAccount, error) {
 	accounts, err := s.ListAccounts(ctx)
 	if err != nil {
 		return nil, err
@@ -107,10 +133,154 @@ func (s *Store) BestUploadAccount(ctx context.Context) (*CloudAccount, error) {
 	if len(accounts) == 0 {
 		return nil, fmt.Errorf("no active accounts")
 	}
-	sort.Slice(accounts, func(i, j int) bool {
-		return accounts[i].TotalSpace-accounts[i].UsedSpace > accounts[j].TotalSpace-accounts[j].UsedSpace
-	})
-	return &accounts[0], nil
+	if requiredSize <= 0 {
+		return &accounts[0], nil
+	}
+	for i := range accounts {
+		if accounts[i].TotalSpace-accounts[i].UsedSpace >= requiredSize {
+			return &accounts[i], nil
+		}
+	}
+	return nil, fmt.Errorf("no active account has enough free space for %d bytes", requiredSize)
+}
+
+func (s *Store) RemoveAccount(ctx context.Context, email string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `DELETE FROM accounts WHERE email=?`, email)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM virtual_files WHERE account_email=?`, email); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return s.normalizeAccountPriorities(ctx)
+}
+
+func (s *Store) SetAccountPriority(ctx context.Context, email string, position int) error {
+	accounts, err := s.ListAccounts(ctx)
+	if err != nil {
+		return err
+	}
+	if len(accounts) == 0 {
+		return fmt.Errorf("no active accounts")
+	}
+	if position < 1 {
+		position = 1
+	}
+	if position > len(accounts) {
+		position = len(accounts)
+	}
+	index := -1
+	for i := range accounts {
+		if accounts[i].Email == email {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		return sql.ErrNoRows
+	}
+	picked := accounts[index]
+	accounts = append(accounts[:index], accounts[index+1:]...)
+	insertAt := position - 1
+	accounts = append(accounts[:insertAt], append([]CloudAccount{picked}, accounts[insertAt:]...)...)
+	return s.writeAccountPriorities(ctx, accounts)
+}
+
+func (s *Store) ensureAccountsPriorityColumn(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(accounts)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name string
+		var typ string
+		var notnull int
+		var dflt sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
+			return err
+		}
+		if name == "priority" {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `ALTER TABLE accounts ADD COLUMN priority INTEGER NOT NULL DEFAULT 0`)
+	return err
+}
+
+func (s *Store) nextAccountPriority(ctx context.Context) (int, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(priority), 0) FROM accounts`)
+	var max int
+	if err := row.Scan(&max); err != nil {
+		return 0, err
+	}
+	return max + 1, nil
+}
+
+func (s *Store) normalizeAccountPriorities(ctx context.Context) error {
+	accounts, err := s.listAccountsUnordered(ctx)
+	if err != nil {
+		return err
+	}
+	if len(accounts) == 0 {
+		return nil
+	}
+	return s.writeAccountPriorities(ctx, accounts)
+}
+
+func (s *Store) listAccountsUnordered(ctx context.Context) ([]CloudAccount, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT email, encrypted_refresh_token, total_space, used_space, priority, is_active, added_at FROM accounts WHERE is_active=1 ORDER BY CASE WHEN priority <= 0 THEN 1 ELSE 0 END, priority, added_at, email`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var accounts []CloudAccount
+	for rows.Next() {
+		var a CloudAccount
+		var active int
+		var added string
+		if err := rows.Scan(&a.Email, &a.EncryptedRefreshToken, &a.TotalSpace, &a.UsedSpace, &a.Priority, &active, &added); err != nil {
+			return nil, err
+		}
+		a.IsActive = active == 1
+		a.AddedAt, _ = time.Parse(time.RFC3339Nano, added)
+		accounts = append(accounts, a)
+	}
+	return accounts, rows.Err()
+}
+
+func (s *Store) writeAccountPriorities(ctx context.Context, accounts []CloudAccount) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for i := range accounts {
+		if _, err := tx.ExecContext(ctx, `UPDATE accounts SET priority=? WHERE email=?`, i+1, accounts[i].Email); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *Store) ReplaceAccountFiles(ctx context.Context, email string, files []VirtualFile) error {

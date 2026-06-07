@@ -492,7 +492,7 @@ func (fs *OmniFS) pickTargetForCreate(ctx context.Context, parent database.Virtu
 		}
 		return *account, parentID, 0
 	}
-	account, err := fs.runtime.store.BestUploadAccount(ctx)
+	account, err := fs.runtime.store.BestUploadAccountForSize(ctx, 0)
 	if err != nil {
 		return database.CloudAccount{}, "", -fuse.ENOSPC
 	}
@@ -500,6 +500,13 @@ func (fs *OmniFS) pickTargetForCreate(ctx context.Context, parent database.Virtu
 }
 
 func (fs *OmniFS) commitHandle(ctx context.Context, h *fileHandle) error {
+	if h.isNew && h.meta.ParentID == "root" {
+		account, err := fs.runtime.store.BestUploadAccountForSize(ctx, h.meta.Size)
+		if err != nil {
+			return err
+		}
+		h.meta.AccountEmail = account.Email
+	}
 	client, err := fs.runtime.openClient(ctx, h.meta.AccountEmail)
 	if err != nil {
 		return err
@@ -558,7 +565,7 @@ func (fs *OmniFS) refreshQuota(ctx context.Context, email string) int {
 		actualEmail = email
 	}
 	returnCode := 0
-	if err := fs.runtime.store.UpsertAccount(ctx, database.CloudAccount{Email: actualEmail, EncryptedRefreshToken: account.EncryptedRefreshToken, TotalSpace: total, UsedSpace: used, IsActive: account.IsActive, AddedAt: account.AddedAt}); err != nil {
+	if err := fs.runtime.store.UpsertAccount(ctx, database.CloudAccount{Email: actualEmail, EncryptedRefreshToken: account.EncryptedRefreshToken, TotalSpace: total, UsedSpace: used, Priority: account.Priority, IsActive: account.IsActive, AddedAt: account.AddedAt}); err != nil {
 		returnCode = -fuse.EIO
 	}
 	return returnCode

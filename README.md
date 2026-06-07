@@ -2,17 +2,6 @@
 
 OmniDrive is a Go prototype for a unified virtual Windows drive backed by multiple Google Drive accounts.
 
-## Current scope
-
-This repository implements the first practical milestone from `blueprint.md`:
-
-- OAuth2 add-account flow with a local callback server.
-- DPAPI encryption for refresh tokens on Windows.
-- Local SQLite cache for accounts and virtual file metadata.
-- Multi-account Google Drive listing and cache merge with name-conflict display names.
-- Smart account selection by largest free quota for future uploads.
-- WinFsp/cgofuse VFS adapter with cache-backed directory reads, on-demand downloads, staged writes, folder creation, rename, delete, and quota reporting.
-
 ## Prerequisites
 
 1. Install Go 1.21 or newer.
@@ -25,16 +14,26 @@ From this folder:
 
 ```powershell
 go mod tidy
-go run .\cmd\omnidrive init
-go run .\cmd\omnidrive add-account --credentials .\credentials.json
-go run .\cmd\omnidrive sync --credentials .\credentials.json
-go run .\cmd\omnidrive list
+go run omnidrive init
+go run omnidrive add-account --credentials .\credentials.json
+go run omnidrive accounts
+go run omnidrive set-priority --email primary@gmail.com --position 1
+go run omnidrive sync --credentials .\credentials.json
+go run omnidrive list
 ```
 
 Mounting requires WinFsp:
 
 ```powershell
-go run .\cmd\omnidrive mount --mountpoint Z:
+go run omnidrive mount --mountpoint Z:
+```
+
+Available account management commands:
+
+```powershell
+go run omnidrive accounts
+go run omnidrive set-priority --email primary@gmail.com --position 1
+go run omnidrive remove-account --email old@gmail.com
 ```
 
 ## Current filesystem behavior
@@ -48,10 +47,11 @@ go run .\cmd\omnidrive mount --mountpoint Z:
 ## Recommended usage flow
 
 1. Run `add-account` for each Google account you want to merge.
-2. Run `sync` before mounting so the virtual tree is populated from the metadata cache.
-3. Mount the drive.
-4. Open files to trigger downloads, then edit/save them normally from Explorer or desktop apps.
-5. If you add files directly in Google Drive outside OmniDrive, run `sync` again to refresh the cache.
+2. Use `accounts` and `set-priority` to put the preferred upload account at the top.
+3. Run `sync` before mounting so the virtual tree is populated from the metadata cache.
+4. Mount the drive.
+5. Open files to trigger downloads, then edit/save them normally from Explorer or desktop apps.
+6. If you add files directly in Google Drive outside OmniDrive, run `sync` again to refresh the cache.
 
 ## Limitations
 
