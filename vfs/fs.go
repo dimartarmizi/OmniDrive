@@ -38,6 +38,10 @@ func (fs *OmniFS) Init() {
 	fs.runtime.startBackgroundSync()
 }
 
+func (fs *OmniFS) Destroy() {
+	_ = fs.runtime.cleanupDirs()
+}
+
 func (fs *OmniFS) Getattr(name string, stat *fuse.Stat_t, fh uint64) int {
 	clean := cleanFusePath(name)
 	if clean == "" {

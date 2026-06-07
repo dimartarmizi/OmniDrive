@@ -76,10 +76,26 @@ func (rt *Runtime) attachHost(host *fuse.FileSystemHost) {
 }
 
 func (rt *Runtime) ensureDirs() error {
+	if err := os.RemoveAll(rt.cacheDir); err != nil {
+		return err
+	}
+	if err := os.RemoveAll(rt.stagingDir); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(rt.cacheDir, 0o700); err != nil {
 		return err
 	}
 	if err := os.MkdirAll(rt.stagingDir, 0o700); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (rt *Runtime) cleanupDirs() error {
+	if err := os.RemoveAll(rt.cacheDir); err != nil {
+		return err
+	}
+	if err := os.RemoveAll(rt.stagingDir); err != nil {
 		return err
 	}
 	return nil
