@@ -127,8 +127,14 @@ func (fs *OmniFS) Create(name string, flags int, mode uint32) (int, uint64) {
 	if clean == "" {
 		return -fuse.EINVAL, 0
 	}
-	if _, err := fs.runtime.store.GetVirtualFile(ctx, clean); err == nil {
-		return -fuse.EEXIST, 0
+	if existing, err := fs.runtime.store.GetVirtualFile(ctx, clean); err == nil {
+		if existing.IsDir {
+			return -fuse.EISDIR, 0
+		}
+		if flags&os.O_EXCL != 0 {
+			return -fuse.EEXIST, 0
+		}
+		return fs.createOverwriteHandle(clean, flags, mode, *existing)
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return -fuse.EIO, 0
 	}
@@ -180,6 +186,35 @@ func (fs *OmniFS) Create(name string, flags int, mode uint32) (int, uint64) {
 		return -fuse.EIO, 0
 	}
 	h := &fileHandle{id: fs.runtime.nextHandleID(), virtualPath: clean, localPath: stagePath, file: file, meta: meta, dirty: true, isNew: true, modified: true}
+	return 0, fs.runtime.rememberHandle(h)
+}
+
+func (fs *OmniFS) createOverwriteHandle(clean string, flags int, mode uint32, meta database.VirtualFile) (int, uint64) {
+	stagePath := fs.runtime.stagePathFor(clean)
+	if err := os.MkdirAll(filepath.Dir(stagePath), 0o700); err != nil {
+		return fuseErr(err), 0
+	}
+	file, err := os.OpenFile(stagePath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, os.FileMode(mode&0o666))
+	if err != nil {
+		return fuseErr(err), 0
+	}
+	meta.ModTime = time.Now()
+	meta.Size = 0
+	h := &fileHandle{
+		id:          fs.runtime.nextHandleID(),
+		virtualPath: clean,
+		localPath:   stagePath,
+		file:        file,
+		meta:        meta,
+		dirty:       true,
+		modified:    true,
+	}
+	if flags&os.O_APPEND != 0 {
+		if _, err := file.Seek(0, io.SeekEnd); err != nil {
+			_ = file.Close()
+			return fuseErr(err), 0
+		}
+	}
 	return 0, fs.runtime.rememberHandle(h)
 }
 
@@ -380,6 +415,9 @@ func (fs *OmniFS) Rename(oldpath string, newpath string) int {
 	ctx := context.Background()
 	oldClean := cleanFusePath(oldpath)
 	newClean := cleanFusePath(newpath)
+	if oldClean == newClean {
+		return 0
+	}
 	meta, err := fs.runtime.store.GetVirtualFile(ctx, oldClean)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -387,8 +425,16 @@ func (fs *OmniFS) Rename(oldpath string, newpath string) int {
 		}
 		return -fuse.EIO
 	}
-	if _, err := fs.runtime.store.GetVirtualFile(ctx, newClean); err == nil {
-		return -fuse.EEXIST
+	if target, err := fs.runtime.store.GetVirtualFile(ctx, newClean); err == nil {
+		if target.IsDir || meta.IsDir {
+			return -fuse.EEXIST
+		}
+		if meta.AccountEmail != target.AccountEmail {
+			return -fuse.EXDEV
+		}
+		if err := fs.replaceExistingFile(ctx, *target); err != nil {
+			return fuseErr(err)
+		}
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return -fuse.EIO
 	}
@@ -426,8 +472,24 @@ func (fs *OmniFS) Rename(oldpath string, newpath string) int {
 	if err := fs.runtime.store.UpsertVirtualFile(ctx, updatedMeta); err != nil {
 		return -fuse.EIO
 	}
+	fs.removeLocalArtifacts(newClean)
 	fs.moveLocalArtifacts(oldClean, newClean)
 	return 0
+}
+
+func (fs *OmniFS) replaceExistingFile(ctx context.Context, target database.VirtualFile) error {
+	client, err := fs.runtime.openClient(ctx, target.AccountEmail)
+	if err != nil {
+		return err
+	}
+	if err := client.DeleteFile(ctx, target.GoogleFileID); err != nil {
+		return err
+	}
+	if err := fs.runtime.store.DeleteVirtualFile(ctx, target.VirtualPath); err != nil {
+		return err
+	}
+	fs.removeLocalArtifacts(target.VirtualPath)
+	return nil
 }
 
 func (fs *OmniFS) Statfs(name string, stat *fuse.Statfs_t) int {
@@ -578,6 +640,11 @@ func (fs *OmniFS) moveLocalArtifacts(oldClean, newClean string) {
 			_ = os.Rename(pair[0], pair[1])
 		}
 	}
+}
+
+func (fs *OmniFS) removeLocalArtifacts(clean string) {
+	_ = os.Remove(fs.runtime.cachePathFor(clean))
+	_ = os.Remove(fs.runtime.stagePathFor(clean))
 }
 
 func cleanFusePath(name string) string {
