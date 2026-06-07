@@ -138,6 +138,12 @@ func (fs *OmniFS) Create(name string, flags int, mode uint32) (int, uint64) {
 		if flags&os.O_EXCL != 0 {
 			return -fuse.EEXIST, 0
 		}
+		if fs.runtime.settings.ConflictPolicy == "deny" {
+			return -fuse.EEXIST, 0
+		}
+		if fs.runtime.settings.ConflictPolicy == "rename" {
+			return -fuse.EEXIST, 0
+		}
 		return fs.createOverwriteHandle(clean, flags, mode, *existing)
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return -fuse.EIO, 0
@@ -431,6 +437,12 @@ func (fs *OmniFS) Rename(oldpath string, newpath string) int {
 	}
 	if target, err := fs.runtime.store.GetVirtualFile(ctx, newClean); err == nil {
 		if target.IsDir || meta.IsDir {
+			return -fuse.EEXIST
+		}
+		if fs.runtime.settings.ConflictPolicy == "deny" {
+			return -fuse.EEXIST
+		}
+		if fs.runtime.settings.ConflictPolicy == "rename" {
 			return -fuse.EEXIST
 		}
 		if meta.AccountEmail != target.AccountEmail {

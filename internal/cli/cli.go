@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"golang.org/x/oauth2"
@@ -19,6 +20,14 @@ type options struct {
 	dbPath          string
 	credentialsPath string
 	mountPoint      string
+	refreshInterval int
+	cleanOnMount    bool
+	cleanOnUnmount  bool
+	autoSyncOnMount bool
+	dirCacheMaxAge  int
+	conflictPolicy  string
+	logLevel        string
+	mountLabel      string
 	email           string
 	position        int
 }
@@ -32,6 +41,14 @@ func Run(args []string) int {
 	cmd := args[0]
 	opt := parseOptions(cmd, args[1:])
 
+	if cmd == "config" {
+		if err := saveConfig(opt); err != nil {
+			return fatal(err)
+		}
+		fmt.Println("OmniDrive config saved:", config.DefaultConfigPath())
+		return 0
+	}
+
 	store, err := database.Open(ctx, opt.dbPath)
 	if err != nil {
 		return fatal(err)
@@ -40,7 +57,18 @@ func Run(args []string) int {
 
 	switch cmd {
 	case "init":
+		settings, err := config.EnsureSettingsFile(config.Settings{
+			CredentialsPath: opt.credentialsPath,
+			MountPoint:      opt.mountPoint,
+		})
+		if err != nil {
+			return fatal(err)
+		}
 		fmt.Println("OmniDrive database ready:", opt.dbPath)
+		fmt.Println("OmniDrive config ready:", config.DefaultConfigPath())
+		if settings.MountPoint != "" {
+			fmt.Println("Mount point:", settings.MountPoint)
+		}
 		return 0
 	case "add-account":
 		if err := requireCredentials(opt.credentialsPath); err != nil {
@@ -87,11 +115,30 @@ func Run(args []string) int {
 		if err := requireCredentials(opt.credentialsPath); err != nil {
 			return fatal(err)
 		}
+		accounts, err := store.ListAccounts(ctx)
+		if err != nil {
+			return fatal(err)
+		}
+		if len(accounts) == 0 {
+			return fatal(fmt.Errorf("no accounts are connected; run `go run omnidrive add-account` first"))
+		}
 		oauthConfig, err := driveapi.LoadOAuthConfig(opt.credentialsPath)
 		if err != nil {
 			return fatal(err)
 		}
-		return vfs.Mount(store, oauthConfig, opt.mountPoint)
+		settings := config.Settings{
+			CredentialsPath:        opt.credentialsPath,
+			MountPoint:             opt.mountPoint,
+			RefreshIntervalSeconds: opt.refreshInterval,
+			CleanCacheOnMount:      opt.cleanOnMount,
+			CleanCacheOnUnmount:    opt.cleanOnUnmount,
+			AutoSyncOnMount:        opt.autoSyncOnMount,
+			DirCacheMaxAgeSeconds:  opt.dirCacheMaxAge,
+			ConflictPolicy:         opt.conflictPolicy,
+			LogLevel:               opt.logLevel,
+			MountLabel:             opt.mountLabel,
+		}
+		return vfs.Mount(store, oauthConfig, settings)
 	default:
 		usage()
 		return 2
@@ -99,15 +146,69 @@ func Run(args []string) int {
 }
 
 func parseOptions(cmd string, args []string) options {
-	opt := options{dbPath: config.DefaultDBPath(), mountPoint: vfs.DefaultMountPoint, position: 1}
+	settings, _ := config.LoadSettings()
+	opt := options{
+		dbPath:          config.DefaultDBPath(),
+		credentialsPath: firstNonEmpty(settings.CredentialsPath, "credentials.json"),
+		mountPoint:      firstNonEmpty(settings.MountPoint, vfs.DefaultMountPoint),
+		refreshInterval: settings.RefreshIntervalSeconds,
+		cleanOnMount:    settings.CleanCacheOnMount,
+		cleanOnUnmount:  settings.CleanCacheOnUnmount,
+		autoSyncOnMount: settings.AutoSyncOnMount,
+		dirCacheMaxAge:  settings.DirCacheMaxAgeSeconds,
+		conflictPolicy:  settings.ConflictPolicy,
+		logLevel:        settings.LogLevel,
+		mountLabel:      settings.MountLabel,
+		position:        1,
+	}
 	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
 	fs.StringVar(&opt.dbPath, "db", opt.dbPath, "SQLite database path")
-	fs.StringVar(&opt.credentialsPath, "credentials", "credentials.json", "Google OAuth credentials JSON")
+	fs.StringVar(&opt.credentialsPath, "credentials", opt.credentialsPath, "Google OAuth credentials JSON")
 	fs.StringVar(&opt.mountPoint, "mountpoint", opt.mountPoint, "VFS mount point")
+	fs.IntVar(&opt.refreshInterval, "refresh-interval", opt.refreshInterval, "Background refresh interval in seconds")
+	fs.BoolVar(&opt.cleanOnMount, "clean-on-mount", opt.cleanOnMount, "Clean cache and staging directories during mount")
+	fs.BoolVar(&opt.cleanOnUnmount, "clean-on-unmount", opt.cleanOnUnmount, "Clean cache and staging directories during unmount")
+	fs.BoolVar(&opt.autoSyncOnMount, "auto-sync-on-mount", opt.autoSyncOnMount, "Run an immediate sync when mounting")
+	fs.IntVar(&opt.dirCacheMaxAge, "dir-cache-max-age", opt.dirCacheMaxAge, "Directory cache max age in seconds")
+	fs.StringVar(&opt.conflictPolicy, "conflict-policy", opt.conflictPolicy, "Conflict policy: overwrite, deny, rename")
+	fs.StringVar(&opt.logLevel, "log-level", opt.logLevel, "Log level: debug, info, error")
+	fs.StringVar(&opt.mountLabel, "mount-label", opt.mountLabel, "Mounted volume label")
 	fs.StringVar(&opt.email, "email", "", "Google account email")
 	fs.IntVar(&opt.position, "position", opt.position, "1-based account priority position")
 	_ = fs.Parse(args)
+	opt.credentialsPath = filepath.Clean(opt.credentialsPath)
+	if opt.refreshInterval < 0 {
+		opt.refreshInterval = 0
+	}
+	if opt.dirCacheMaxAge < 0 {
+		opt.dirCacheMaxAge = 0
+	}
 	return opt
+}
+
+func saveConfig(opt options) error {
+	settings := config.Settings{
+		CredentialsPath:        opt.credentialsPath,
+		MountPoint:             opt.mountPoint,
+		RefreshIntervalSeconds: opt.refreshInterval,
+		CleanCacheOnMount:      opt.cleanOnMount,
+		CleanCacheOnUnmount:    opt.cleanOnUnmount,
+		AutoSyncOnMount:        opt.autoSyncOnMount,
+		DirCacheMaxAgeSeconds:  opt.dirCacheMaxAge,
+		ConflictPolicy:         opt.conflictPolicy,
+		LogLevel:               opt.logLevel,
+		MountLabel:             opt.mountLabel,
+	}
+	return config.SaveSettings(settings)
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func addAccount(ctx context.Context, store *database.Store, credentialsPath string) error {
@@ -257,6 +358,7 @@ func requireCredentials(path string) error {
 
 func usage() {
 	fmt.Println("OmniDrive commands:")
+	fmt.Println("  config [--credentials credentials.json] [--mountpoint Z:] [--refresh-interval 10] [--clean-on-mount=true] [--clean-on-unmount=true] [--db path]")
 	fmt.Println("  init [--db path]")
 	fmt.Println("  add-account --credentials credentials.json [--db path]")
 	fmt.Println("  remove-account --email user@gmail.com [--db path]")
@@ -265,7 +367,7 @@ func usage() {
 	fmt.Println("  sync --credentials credentials.json [--db path]")
 	fmt.Println("  list [--db path]")
 	fmt.Println("  best-account [--db path]")
-	fmt.Println("  mount [--mountpoint Z:] [--db path]")
+	fmt.Println("  mount [--mountpoint Z:] [--refresh-interval 10] [--clean-on-mount=true] [--clean-on-unmount=true] [--db path]")
 }
 
 func fatal(err error) int {

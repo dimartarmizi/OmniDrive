@@ -6,6 +6,7 @@ package vfs
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,6 +25,7 @@ import (
 type Runtime struct {
 	store        *database.Store
 	oauthConfig  *oauth2.Config
+	settings     config.Settings
 	cacheDir     string
 	stagingDir   string
 	handleSeq    atomic.Uint64
@@ -32,6 +34,7 @@ type Runtime struct {
 	downloadsMu  sync.Mutex
 	downloadOnce map[string]*sync.Once
 	host         *fuse.FileSystemHost
+	logger       *log.Logger
 	syncStart    sync.Once
 	syncMu       sync.Mutex
 	syncCond     *sync.Cond
@@ -54,16 +57,25 @@ type fileHandle struct {
 	deleted     bool
 }
 
-func NewRuntime(store *database.Store, oauthConfig *oauth2.Config) *Runtime {
+func NewRuntime(store *database.Store, oauthConfig *oauth2.Config, settings config.Settings) *Runtime {
+	settings = config.NormalizeSettings(settings)
 	rt := &Runtime{
 		store:        store,
 		oauthConfig:  oauthConfig,
+		settings:     settings,
 		cacheDir:     config.DefaultCacheDir(),
 		stagingDir:   config.DefaultStagingDir(),
 		handles:      map[uint64]*fileHandle{},
 		downloadOnce: map[string]*sync.Once{},
-		syncInterval: 10 * time.Second,
-		dirMaxAge:    5 * time.Second,
+		syncInterval: time.Duration(settings.RefreshIntervalSeconds) * time.Second,
+		dirMaxAge:    time.Duration(settings.DirCacheMaxAgeSeconds) * time.Second,
+		logger:       log.New(os.Stderr, "[omnidrive] ", log.LstdFlags),
+	}
+	if rt.syncInterval <= 0 {
+		rt.syncInterval = 10 * time.Second
+	}
+	if rt.dirMaxAge <= 0 {
+		rt.dirMaxAge = 5 * time.Second
 	}
 	rt.syncCond = sync.NewCond(&rt.syncMu)
 	return rt
@@ -76,11 +88,13 @@ func (rt *Runtime) attachHost(host *fuse.FileSystemHost) {
 }
 
 func (rt *Runtime) ensureDirs() error {
-	if err := os.RemoveAll(rt.cacheDir); err != nil {
-		return err
-	}
-	if err := os.RemoveAll(rt.stagingDir); err != nil {
-		return err
+	if rt.settings.CleanCacheOnMount {
+		if err := os.RemoveAll(rt.cacheDir); err != nil {
+			return err
+		}
+		if err := os.RemoveAll(rt.stagingDir); err != nil {
+			return err
+		}
 	}
 	if err := os.MkdirAll(rt.cacheDir, 0o700); err != nil {
 		return err
@@ -92,6 +106,9 @@ func (rt *Runtime) ensureDirs() error {
 }
 
 func (rt *Runtime) cleanupDirs() error {
+	if !rt.settings.CleanCacheOnUnmount {
+		return nil
+	}
 	if err := os.RemoveAll(rt.cacheDir); err != nil {
 		return err
 	}
@@ -152,9 +169,16 @@ func (rt *Runtime) closeHandle(id uint64) {
 func (rt *Runtime) startBackgroundSync() {
 	rt.syncStart.Do(func() {
 		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-			_ = rt.refreshNow(ctx, 0)
-			cancel()
+			if rt.settings.AutoSyncOnMount {
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+				if err := rt.refreshNow(ctx, 0); err != nil {
+					rt.logf("error", "initial sync failed: %v", err)
+				}
+				cancel()
+			}
+			if rt.syncInterval <= 0 {
+				return
+			}
 			ticker := time.NewTicker(rt.syncInterval)
 			defer ticker.Stop()
 			for range ticker.C {
@@ -168,8 +192,23 @@ func (rt *Runtime) refreshIfStale(maxAge time.Duration) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
-		_ = rt.refreshNow(ctx, maxAge)
+		if err := rt.refreshNow(ctx, maxAge); err != nil {
+			rt.logf("error", "background refresh failed: %v", err)
+		}
 	}()
+}
+
+func (rt *Runtime) logf(level string, format string, args ...any) {
+	allowed := map[string]int{"debug": 1, "info": 2, "error": 3}
+	current := allowed[rt.settings.LogLevel]
+	messageLevel := allowed[level]
+	if current == 0 {
+		current = allowed["info"]
+	}
+	if messageLevel < current {
+		return
+	}
+	rt.logger.Printf("[%s] %s", strings.ToUpper(level), fmt.Sprintf(format, args...))
 }
 
 func (rt *Runtime) refreshDirectoriesNow(ctx context.Context) error {

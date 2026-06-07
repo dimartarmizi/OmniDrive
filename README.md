@@ -15,18 +15,20 @@ From this folder:
 ```powershell
 go mod tidy
 go run omnidrive init
-go run omnidrive add-account --credentials .\credentials.json
+go run omnidrive add-account
 go run omnidrive accounts
 go run omnidrive set-priority --email primary@gmail.com --position 1
-go run omnidrive sync --credentials .\credentials.json
+go run omnidrive sync
 go run omnidrive list
 ```
 
 Mounting requires WinFsp:
 
 ```powershell
-go run omnidrive mount --mountpoint Z:
+go run omnidrive mount
 ```
+
+On first `init`, OmniDrive creates `config.json` in the project folder with default values such as `credentials.json`, `Z:`, a 10-second refresh interval, automatic cache/staging cleanup on mount and unmount, automatic sync on mount, 5-second directory cache age, overwrite conflict policy, `info` log level, and `OmniDrive` as the mount label. After that, `add-account`, `sync`, and `mount` reuse those values from that file.
 
 Available account management commands:
 
@@ -34,7 +36,33 @@ Available account management commands:
 go run omnidrive accounts
 go run omnidrive set-priority --email primary@gmail.com --position 1
 go run omnidrive remove-account --email old@gmail.com
+go run omnidrive config --credentials .\credentials.json --mountpoint Y: --refresh-interval 30 --clean-on-mount=true --clean-on-unmount=false --auto-sync-on-mount=true --dir-cache-max-age 15 --conflict-policy overwrite --log-level info --mount-label OmniDrive
 ```
+
+Example `config.json`:
+
+```json
+{
+	"credentials_path": "credentials.json",
+	"mount_point": "Z:",
+	"refresh_interval_seconds": 10,
+	"clean_cache_on_mount": true,
+	"clean_cache_on_unmount": true,
+	"auto_sync_on_mount": true,
+	"dir_cache_max_age_seconds": 5,
+	"conflict_policy": "overwrite",
+	"log_level": "info",
+	"mount_label": "OmniDrive"
+}
+```
+
+Config tambahan:
+
+- `auto_sync_on_mount`: jalankan refresh metadata otomatis saat mount.
+- `dir_cache_max_age_seconds`: batas umur cache listing folder sebelum di-refresh.
+- `conflict_policy`: `overwrite`, `deny`, atau `rename`.
+- `log_level`: `debug`, `info`, atau `error`.
+- `mount_label`: nama volume yang tampil di Explorer.
 
 ## Current filesystem behavior
 
@@ -62,4 +90,6 @@ go run omnidrive remove-account --email old@gmail.com
 ## Runtime data
 
 By default data is stored in `%LOCALAPPDATA%\\OmniDrive\\omnidrive.db`.
-Use `--db` to override the database path.
+Use `--db` to override the database path temporarily when needed.
+
+Default command settings are stored in `config.json`.

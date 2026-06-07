@@ -11,6 +11,7 @@ cache/
 tmp/
 credentials.json
 client_secret*.json
+config.json
 
 # Go
 docs/

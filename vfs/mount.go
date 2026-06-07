@@ -8,14 +8,15 @@ import (
 
 	"golang.org/x/oauth2"
 
+	"omnidrive/config"
 	"omnidrive/database"
 )
 
-func Mount(store *database.Store, oauthConfig *oauth2.Config, mountPoint string) int {
-	runtime := NewRuntime(store, oauthConfig)
+func Mount(store *database.Store, oauthConfig *oauth2.Config, settings config.Settings) int {
+	runtime := NewRuntime(store, oauthConfig, settings)
 	host := fuse.NewFileSystemHost(New(runtime))
 	runtime.attachHost(host)
-	if host.Mount(mountPoint, []string{"-o", "volname=OmniDrive"}) {
+	if host.Mount(settings.MountPoint, []string{"-o", "volname=" + settings.MountLabel}) {
 		return 0
 	}
 	return -1
